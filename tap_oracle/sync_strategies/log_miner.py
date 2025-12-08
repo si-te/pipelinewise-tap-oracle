@@ -170,17 +170,74 @@ def sync_tables(conn_config, streams, state, end_scn, scn_window_size = None):
    cur.close()
    connection.close()
 
+def add_log_files_for_scn_range(cur, start_scn, end_scn):
+   """Add redo log and archived log files covering the SCN range for Oracle 19c compatibility."""
+   # Add online redo logs
+   cur.execute("""
+      SELECT DISTINCT member FROM v$logfile
+   """)
+   log_files = cur.fetchall()
+   
+   if not log_files:
+      raise Exception("No redo log files found")
+   
+   # Add the first log file with NEW option to start fresh
+   first_file = True
+   for (log_file,) in log_files:
+      if first_file:
+         cur.execute("""
+            BEGIN
+               DBMS_LOGMNR.ADD_LOGFILE(
+                  LOGFILENAME => :log_file,
+                  OPTIONS => DBMS_LOGMNR.NEW);
+            END;
+         """, log_file=log_file)
+         first_file = False
+      else:
+         cur.execute("""
+            BEGIN
+               DBMS_LOGMNR.ADD_LOGFILE(
+                  LOGFILENAME => :log_file,
+                  OPTIONS => DBMS_LOGMNR.ADDFILE);
+            END;
+         """, log_file=log_file)
+   
+   # Add archived logs that cover our SCN range
+   cur.execute("""
+      SELECT name FROM v$archived_log 
+      WHERE first_change# <= :end_scn 
+        AND next_change# >= :start_scn
+        AND name IS NOT NULL
+        AND deleted = 'NO'
+      ORDER BY first_change#
+   """, start_scn=start_scn, end_scn=end_scn)
+   
+   archived_logs = cur.fetchall()
+   for (archived_log,) in archived_logs:
+      try:
+         cur.execute("""
+            BEGIN
+               DBMS_LOGMNR.ADD_LOGFILE(
+                  LOGFILENAME => :log_file,
+                  OPTIONS => DBMS_LOGMNR.ADDFILE);
+            END;
+         """, log_file=archived_log)
+      except Exception as e:
+         LOGGER.warning("Could not add archived log %s: %s", archived_log, e)
+
 def sync_tables_logminer(cur, streams, state, start_scn, end_scn):
 
    time_extracted = utils.now()
+
+   # Add log files manually (required for Oracle 19c since CONTINUOUS_MINE is deprecated)
+   add_log_files_for_scn_range(cur, start_scn, end_scn)
 
    start_logmnr_sql = """BEGIN
                          DBMS_LOGMNR.START_LOGMNR(
                                  startScn => {},
                                  endScn => {},
                                  OPTIONS => DBMS_LOGMNR.DICT_FROM_ONLINE_CATALOG +
-                                            DBMS_LOGMNR.COMMITTED_DATA_ONLY +
-                                            DBMS_LOGMNR.CONTINUOUS_MINE);
+                                            DBMS_LOGMNR.COMMITTED_DATA_ONLY);
                          END;""".format(start_scn, end_scn)
 
    LOGGER.info("Starting LogMiner for %s: %s -> %s", list(map(lambda s: s.tap_stream_id, streams)), start_scn, end_scn)

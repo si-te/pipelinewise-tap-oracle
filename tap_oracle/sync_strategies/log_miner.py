@@ -147,7 +147,10 @@ def sync_tables(conn_config, streams, state, end_scn, scn_window_size = None):
                 reduction_factor = max(0, reduction_factor - 1)
                 iter_with_reduction_factor = ITER_WITH_REDUCTION_FACTOR
       except oracledb.DatabaseError as ex:
-         cur.execute("DBMS_LOGMNR.END_LOGMNR()")
+         try:
+            cur.execute("BEGIN DBMS_LOGMNR.END_LOGMNR(); END;")
+         except:
+            pass  # Ignore errors when ending LogMiner session
          cur.close()
          LOGGER.warning(f"Exception at start_scn={start_scn_window} stop_scn={stop_scn_window} reduction_factor={reduction_factor}")
          iter_with_reduction_factor = ITER_WITH_REDUCTION_FACTOR
@@ -171,36 +174,51 @@ def sync_tables(conn_config, streams, state, end_scn, scn_window_size = None):
    connection.close()
 
 def add_log_files_for_scn_range(cur, start_scn, end_scn):
-   """Add redo log and archived log files covering the SCN range for Oracle 19c compatibility."""
-   # Add online redo logs
-   cur.execute("""
-      SELECT DISTINCT member FROM v$logfile
-   """)
-   log_files = cur.fetchall()
+   """Add redo log and archived log files covering the SCN range for Oracle 19c compatibility.
    
-   if not log_files:
-      raise Exception("No redo log files found")
-   
-   # Add the first log file with NEW option to start fresh
+   Note: LogMiner sessions are per-connection, not global. Multiple processes can run
+   LogMiner concurrently on separate connections without interfering with each other.
+   """
+   files_added = 0
    first_file = True
-   for (log_file,) in log_files:
-      if first_file:
-         cur.execute("""
-            BEGIN
-               DBMS_LOGMNR.ADD_LOGFILE(
-                  LOGFILENAME => :log_file,
-                  OPTIONS => DBMS_LOGMNR.NEW);
-            END;
-         """, log_file=log_file)
-         first_file = False
-      else:
-         cur.execute("""
-            BEGIN
-               DBMS_LOGMNR.ADD_LOGFILE(
-                  LOGFILENAME => :log_file,
-                  OPTIONS => DBMS_LOGMNR.ADDFILE);
-            END;
-         """, log_file=log_file)
+   
+   # Get online redo logs that contain the SCN range
+   # Join v$log with v$logfile to get logs covering our SCN range
+   cur.execute("""
+      SELECT DISTINCT lf.member 
+      FROM v$logfile lf
+      JOIN v$log l ON lf.group# = l.group#
+      WHERE l.first_change# <= :end_scn
+        AND (l.next_change# >= :start_scn OR l.next_change# = 0)
+      ORDER BY lf.member
+   """, start_scn=start_scn, end_scn=end_scn)
+   
+   online_logs = cur.fetchall()
+   LOGGER.info("Found %d online redo log files for SCN range %s -> %s", len(online_logs), start_scn, end_scn)
+   
+   for (log_file,) in online_logs:
+      try:
+         if first_file:
+            cur.execute("""
+               BEGIN
+                  DBMS_LOGMNR.ADD_LOGFILE(
+                     LOGFILENAME => :log_file,
+                     OPTIONS => DBMS_LOGMNR.NEW);
+               END;
+            """, [log_file])
+            first_file = False
+         else:
+            cur.execute("""
+               BEGIN
+                  DBMS_LOGMNR.ADD_LOGFILE(
+                     LOGFILENAME => :log_file,
+                     OPTIONS => DBMS_LOGMNR.ADDFILE);
+               END;
+            """, [log_file])
+         files_added += 1
+         LOGGER.debug("Added online redo log: %s", log_file)
+      except Exception as e:
+         LOGGER.warning("Could not add online redo log %s: %s", log_file, e)
    
    # Add archived logs that cover our SCN range
    cur.execute("""
@@ -209,21 +227,40 @@ def add_log_files_for_scn_range(cur, start_scn, end_scn):
         AND next_change# >= :start_scn
         AND name IS NOT NULL
         AND deleted = 'NO'
+        AND standby_dest = 'NO'
       ORDER BY first_change#
    """, start_scn=start_scn, end_scn=end_scn)
    
    archived_logs = cur.fetchall()
+   LOGGER.info("Found %d archived log files for SCN range %s -> %s", len(archived_logs), start_scn, end_scn)
+   
    for (archived_log,) in archived_logs:
       try:
-         cur.execute("""
-            BEGIN
-               DBMS_LOGMNR.ADD_LOGFILE(
-                  LOGFILENAME => :log_file,
-                  OPTIONS => DBMS_LOGMNR.ADDFILE);
-            END;
-         """, log_file=archived_log)
+         if first_file:
+            cur.execute("""
+               BEGIN
+                  DBMS_LOGMNR.ADD_LOGFILE(
+                     LOGFILENAME => :log_file,
+                     OPTIONS => DBMS_LOGMNR.NEW);
+               END;
+            """, [archived_log])
+            first_file = False
+         else:
+            cur.execute("""
+               BEGIN
+                  DBMS_LOGMNR.ADD_LOGFILE(
+                     LOGFILENAME => :log_file,
+                     OPTIONS => DBMS_LOGMNR.ADDFILE);
+               END;
+            """, [archived_log])
+         files_added += 1
+         LOGGER.debug("Added archived log: %s", archived_log)
       except Exception as e:
          LOGGER.warning("Could not add archived log %s: %s", archived_log, e)
+   
+   if files_added == 0:
+      raise Exception(f"No log files found covering SCN range {start_scn} -> {end_scn}. "
+                      "Ensure archived logs are available or the SCN range is within online redo logs.")
 
 def sync_tables_logminer(cur, streams, state, start_scn, end_scn):
 
@@ -301,5 +338,8 @@ def sync_tables_logminer(cur, streams, state, start_scn, end_scn):
       LOGGER.info("updating bookmark for stream %s to end_lsn %s", s.tap_stream_id, end_scn)
       state = singer.write_bookmark(state, s.tap_stream_id, 'scn', end_scn)
       singer.write_message(singer.StateMessage(value=copy.deepcopy(state)))
+
+   # End the LogMiner session to release resources before next SCN window
+   cur.execute("BEGIN DBMS_LOGMNR.END_LOGMNR(); END;")
 
    return state

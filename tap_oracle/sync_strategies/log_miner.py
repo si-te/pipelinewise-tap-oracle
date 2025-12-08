@@ -2,8 +2,6 @@
 import copy
 import datetime
 import decimal
-import pdb
-import time
 
 import dateutil.parser
 import pytz
@@ -176,55 +174,21 @@ def sync_tables(conn_config, streams, state, end_scn, scn_window_size = None):
 def add_log_files_for_scn_range(cur, start_scn, end_scn):
    """Add redo log and archived log files covering the SCN range for Oracle 19c compatibility.
    
+   Log files are added in SCN order (by first_change#) to ensure continuous coverage.
+   Archived logs are prioritized for historical data, then online redo logs for recent changes.
+   
    Note: LogMiner sessions are per-connection, not global. Multiple processes can run
    LogMiner concurrently on separate connections without interfering with each other.
    """
-   files_added = 0
-   first_file = True
+   # Collect all log files (archived and online) with their SCN ranges, then add in order
+   all_logs = []
    
-   # Get online redo logs that contain the SCN range
-   # Join v$log with v$logfile to get logs covering our SCN range
+   # Get archived logs that cover our SCN range
    cur.execute("""
-      SELECT DISTINCT lf.member 
-      FROM v$logfile lf
-      JOIN v$log l ON lf.group# = l.group#
-      WHERE l.first_change# <= :end_scn
-        AND (l.next_change# >= :start_scn OR l.next_change# = 0)
-      ORDER BY lf.member
-   """, start_scn=start_scn, end_scn=end_scn)
-   
-   online_logs = cur.fetchall()
-   LOGGER.info("Found %d online redo log files for SCN range %s -> %s", len(online_logs), start_scn, end_scn)
-   
-   for (log_file,) in online_logs:
-      try:
-         if first_file:
-            cur.execute("""
-               BEGIN
-                  DBMS_LOGMNR.ADD_LOGFILE(
-                     LOGFILENAME => :log_file,
-                     OPTIONS => DBMS_LOGMNR.NEW);
-               END;
-            """, [log_file])
-            first_file = False
-         else:
-            cur.execute("""
-               BEGIN
-                  DBMS_LOGMNR.ADD_LOGFILE(
-                     LOGFILENAME => :log_file,
-                     OPTIONS => DBMS_LOGMNR.ADDFILE);
-               END;
-            """, [log_file])
-         files_added += 1
-         LOGGER.debug("Added online redo log: %s", log_file)
-      except Exception as e:
-         LOGGER.warning("Could not add online redo log %s: %s", log_file, e)
-   
-   # Add archived logs that cover our SCN range
-   cur.execute("""
-      SELECT name FROM v$archived_log 
+      SELECT name, first_change#, 'ARCHIVED' as log_type
+      FROM v$archived_log 
       WHERE first_change# <= :end_scn 
-        AND next_change# >= :start_scn
+        AND next_change# > :start_scn
         AND name IS NOT NULL
         AND deleted = 'NO'
         AND standby_dest = 'NO'
@@ -233,18 +197,45 @@ def add_log_files_for_scn_range(cur, start_scn, end_scn):
    
    archived_logs = cur.fetchall()
    LOGGER.info("Found %d archived log files for SCN range %s -> %s", len(archived_logs), start_scn, end_scn)
+   all_logs.extend(archived_logs)
    
-   for (archived_log,) in archived_logs:
+   # Get online redo logs that contain the SCN range
+   # Note: CURRENT log has status='CURRENT' and contains the most recent changes
+   cur.execute("""
+      SELECT DISTINCT lf.member, l.first_change#, 'ONLINE' as log_type
+      FROM v$logfile lf
+      JOIN v$log l ON lf.group# = l.group#
+      WHERE l.first_change# <= :end_scn
+        AND (l.next_change# > :start_scn OR l.status = 'CURRENT')
+      ORDER BY l.first_change#, lf.member
+   """, start_scn=start_scn, end_scn=end_scn)
+   
+   online_logs = cur.fetchall()
+   LOGGER.info("Found %d online redo log files for SCN range %s -> %s", len(online_logs), start_scn, end_scn)
+   all_logs.extend(online_logs)
+   
+   # Sort all logs by first_change# to ensure they're added in SCN order
+   all_logs.sort(key=lambda x: x[1])
+   
+   # Remove duplicates (same SCN range might be in both archived and online)
+   seen_files = set()
+   unique_logs = []
+   for log in all_logs:
+      if log[0] not in seen_files:
+         seen_files.add(log[0])
+         unique_logs.append(log)
+   
+   files_added = 0
+   for idx, (log_file, first_change, log_type) in enumerate(unique_logs):
       try:
-         if first_file:
+         if idx == 0:
             cur.execute("""
                BEGIN
                   DBMS_LOGMNR.ADD_LOGFILE(
                      LOGFILENAME => :log_file,
                      OPTIONS => DBMS_LOGMNR.NEW);
                END;
-            """, [archived_log])
-            first_file = False
+            """, [log_file])
          else:
             cur.execute("""
                BEGIN
@@ -252,11 +243,12 @@ def add_log_files_for_scn_range(cur, start_scn, end_scn):
                      LOGFILENAME => :log_file,
                      OPTIONS => DBMS_LOGMNR.ADDFILE);
                END;
-            """, [archived_log])
+            """, [log_file])
          files_added += 1
-         LOGGER.debug("Added archived log: %s", archived_log)
-      except Exception as e:
-         LOGGER.warning("Could not add archived log %s: %s", archived_log, e)
+         LOGGER.debug("Added %s log: %s (first_change#=%s)", log_type.lower(), log_file, first_change)
+      except oracledb.DatabaseError as e:
+         # Log specific Oracle errors but continue trying other files
+         LOGGER.warning("Could not add %s log %s: %s", log_type.lower(), log_file, e)
    
    if files_added == 0:
       raise Exception(f"No log files found covering SCN range {start_scn} -> {end_scn}. "

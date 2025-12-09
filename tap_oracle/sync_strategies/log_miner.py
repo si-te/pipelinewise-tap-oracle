@@ -270,7 +270,7 @@ def sync_tables_logminer(cur, streams, state, start_scn, end_scn):
                          END;""".format(start_scn, end_scn)
 
    LOGGER.info("Starting LogMiner for %s: %s -> %s", list(map(lambda s: s.tap_stream_id, streams)), start_scn, end_scn)
-   LOGGER.info("%s",start_logmnr_sql)
+   LOGGER.debug("%s",start_logmnr_sql)
    cur.execute(start_logmnr_sql)
 
    #mine changes
@@ -301,7 +301,7 @@ def sync_tables_logminer(cur, streams, state, start_scn, end_scn):
          
          LOGGER.info("Examining log for table %s", stream.tap_stream_id)
          common.send_schema_message(stream, ['lsn'])
-         LOGGER.info("mine_sql=%s", mine_sql)
+         LOGGER.debug("mine_sql=%s", mine_sql)
          for op, redo, scn, cscn, commit_ts, *col_vals in cur.execute(mine_sql, binds):
             redo_vals = col_vals[0:len(desired_columns)]
             undo_vals = col_vals[len(desired_columns):]
